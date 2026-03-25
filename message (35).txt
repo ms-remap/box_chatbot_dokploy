@@ -1,0 +1,384 @@
+"""
+Box Chatbot — FastAPI + CLI
+Connects to Box MCP server at localhost:8005
+Flow:
+  1. User asks any question
+  2. Search Box for relevant files (box_search_tool)
+  3. Ask Box AI about those files (box_ai_ask_file_multi_tool)
+  4. Return answer with file citations
+
+Usage (CLI):
+    python box_chatbot.py
+
+Usage (API):
+    uvicorn box_chatbot:app --host 0.0.0.0 --port 8006
+"""
+
+import json
+import requests
+import time
+import traceback
+from typing import Optional, List
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+# ============================================================
+# ======================== CONFIG ============================
+# ============================================================
+
+BOX_MCP_URL = "http://localhost:8005/mcp"
+BOX_TOKEN = "BXqAUxExN5cUbAqcw8ZiNlmT3zRs3cVk"   # update when token expires
+
+MCP_HEADERS = {
+    "Authorization": f"Bearer {BOX_TOKEN}",
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/event-stream",
+    "Mcp-Protocol-Version": "2025-03-26",
+}
+
+MAX_FILES_FOR_AI = 10       # max files to pass to Box AI at once
+MAX_SEARCH_RESULTS = 20     # max files returned from search
+
+
+# ============================================================
+# ======================== LOGGING ===========================
+# ============================================================
+
+def _now():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+def log(msg):
+    print(f"[{_now()}][BOX] {msg}", flush=True)
+
+def log_err(msg):
+    print(f"[{_now()}][BOX][ERROR] {msg}", flush=True)
+
+
+# ============================================================
+# =================== MCP HELPER ============================
+# ============================================================
+
+_mcp_id = 0
+
+def _next_id():
+    global _mcp_id
+    _mcp_id += 1
+    return _mcp_id
+
+
+def mcp_call(method: str, params: dict) -> dict:
+    """
+    Call a Box MCP tool and return the result dict.
+    Parses SSE response (event: message / data: {...}).
+    """
+    payload = {
+        "jsonrpc": "2.0",
+        "id": _next_id(),
+        "method": method,
+        "params": params,
+    }
+    log(f"mcp_call() method={method} params_keys={list(params.keys())}")
+
+    try:
+        r = requests.post(BOX_MCP_URL, headers=MCP_HEADERS, json=payload, timeout=60)
+        r.raise_for_status()
+    except Exception as e:
+        log_err(f"MCP HTTP error: {e}")
+        raise RuntimeError(f"Box MCP HTTP error: {e}") from e
+
+    # Parse SSE format: lines like "data: {...}"
+    raw = r.text.strip()
+    data_line = None
+    for line in raw.splitlines():
+        if line.startswith("data:"):
+            data_line = line[len("data:"):].strip()
+            break
+
+    if not data_line:
+        log_err(f"No data line in MCP response: {raw[:300]}")
+        raise RuntimeError(f"Unexpected MCP response format: {raw[:300]}")
+
+    try:
+        resp = json.loads(data_line)
+    except Exception as e:
+        log_err(f"Failed to parse MCP JSON: {e} | raw={data_line[:300]}")
+        raise RuntimeError(f"MCP JSON parse error: {e}") from e
+
+    if "error" in resp:
+        log_err(f"MCP returned error: {resp['error']}")
+        raise RuntimeError(f"Box MCP error: {resp['error']}")
+
+    result = resp.get("result", {})
+    log(f"mcp_call() success, result_keys={list(result.keys()) if isinstance(result, dict) else type(result)}")
+    return result
+
+
+def call_tool(tool_name: str, arguments: dict) -> dict:
+    """Call a specific Box MCP tool by name."""
+    return mcp_call("tools/call", {
+        "name": tool_name,
+        "arguments": arguments,
+    })
+
+
+# ============================================================
+# =================== BOX TOOLS ==============================
+# ============================================================
+
+def box_search(query: str, max_results: int = MAX_SEARCH_RESULTS) -> List[dict]:
+    """
+    Search Box for files matching the query.
+    Returns list of file dicts with id, name, type.
+    """
+    log(f"box_search() query={query!r}")
+    try:
+        result = call_tool("box_search_tool", {
+            "query": query,
+            "where_to_look_for_query": ["NAME", "DESCRIPTION", "FILE_CONTENT", "TAG"],
+        })
+        # Result is {"result": [...]} or just a list
+        files = result.get("result", result) if isinstance(result, dict) else result
+        if not isinstance(files, list):
+            files = []
+
+        # Filter to actual files only (not folders/web_links)
+        files = [f for f in files if f.get("type") == "file"][:max_results]
+        log(f"box_search() found {len(files)} files")
+        return files
+    except Exception as e:
+        log_err(f"box_search() failed: {e}")
+        return []
+
+
+def box_ai_ask_files(file_ids: List[str], question: str) -> str:
+    """
+    Ask Box AI a question about a list of files.
+    Uses multi-file tool if >1 file, single-file tool if 1 file.
+    """
+    if not file_ids:
+        return "No relevant files found in your Box account for this question."
+
+    # Limit to MAX_FILES_FOR_AI
+    file_ids = file_ids[:MAX_FILES_FOR_AI]
+    log(f"box_ai_ask_files() file_ids={file_ids}, question={question!r}")
+
+    try:
+        if len(file_ids) == 1:
+            result = call_tool("box_ai_ask_file_single_tool", {
+                "file_id": file_ids[0],
+                "prompt": question,
+            })
+        else:
+            result = call_tool("box_ai_ask_file_multi_tool", {
+                "file_ids": file_ids,
+                "prompt": question,
+            })
+
+        # Extract answer text from result
+        if isinstance(result, dict):
+            answer = (
+                result.get("answer")
+                or result.get("response")
+                or result.get("content")
+                or result.get("result")
+                or str(result)
+            )
+        else:
+            answer = str(result)
+
+        log(f"box_ai_ask_files() got answer, len={len(str(answer))}")
+        return str(answer)
+
+    except Exception as e:
+        log_err(f"box_ai_ask_files() failed: {e}")
+        return f"Box AI could not answer this question. Error: {e}"
+
+
+def box_ai_freeform(file_ids: List[str], question: str) -> str:
+    """
+    Fallback: use freeform extraction if ask tool fails.
+    """
+    log(f"box_ai_freeform() file_ids={file_ids}")
+    try:
+        result = call_tool("box_ai_extract_freeform_tool", {
+            "file_ids": file_ids[:MAX_FILES_FOR_AI],
+            "prompt": question,
+        })
+        answer = result.get("answer") or result.get("result") or str(result)
+        return str(answer)
+    except Exception as e:
+        log_err(f"box_ai_freeform() failed: {e}")
+        return f"Could not extract answer from files. Error: {e}"
+
+
+# ============================================================
+# =================== CORE CHATBOT LOGIC =====================
+# ============================================================
+
+def answer_question(question: str) -> dict:
+    """
+    Main pipeline:
+    1. Search Box for relevant files
+    2. Ask Box AI about those files
+    3. Return answer + file citations
+    """
+    log(f"answer_question() question={question!r}")
+
+    # Step 1: Search Box
+    log("Step 1: Searching Box...")
+    files = box_search(question)
+
+    if not files:
+        # Try a broader search with key nouns only
+        words = [w for w in question.split() if len(w) > 3]
+        broad_query = " ".join(words[:5])
+        log(f"No results, trying broader query: {broad_query!r}")
+        if broad_query:
+            files = box_search(broad_query)
+
+    if not files:
+        return {
+            "question": question,
+            "answer": (
+                "I searched your Box account but couldn't find any files relevant to your question. "
+                "Try rephrasing with different keywords, or check that the files exist in your Box account."
+            ),
+            "files_searched": [],
+            "num_files": 0,
+        }
+
+    # Step 2: Extract file IDs and names for citations
+    file_ids = [f["id"] for f in files if f.get("id")]
+    file_names = [f.get("name", f.get("id", "unknown")) for f in files]
+
+    log(f"Step 2: Asking Box AI about {len(file_ids)} files...")
+    answer = box_ai_ask_files(file_ids, question)
+
+    # If answer looks like an error, try freeform as fallback
+    if not answer or "error" in answer.lower()[:50]:
+        log("Trying freeform fallback...")
+        answer = box_ai_freeform(file_ids, question)
+
+    return {
+        "question": question,
+        "answer": answer,
+        "files_searched": file_names[:MAX_FILES_FOR_AI],
+        "num_files": len(file_ids),
+    }
+
+
+# ============================================================
+# ====================== FASTAPI =============================
+# ============================================================
+
+app = FastAPI(title="Box Chatbot API", version="1.0.0")
+
+
+class QuestionRequest(BaseModel):
+    question: str
+    token: Optional[str] = None   # optional token override per request
+
+
+class QuestionResponse(BaseModel):
+    question: str
+    answer: str
+    files_searched: List[str]
+    num_files: int
+
+
+@app.post("/ask", response_model=QuestionResponse)
+def ask(body: QuestionRequest):
+    global BOX_TOKEN, MCP_HEADERS
+
+    # Allow per-request token override
+    if body.token:
+        BOX_TOKEN = body.token
+        MCP_HEADERS["Authorization"] = f"Bearer {BOX_TOKEN}"
+
+    if not body.question.strip():
+        raise HTTPException(status_code=400, detail="question cannot be empty")
+
+    try:
+        result = answer_question(body.question.strip())
+        return QuestionResponse(**result)
+    except Exception as e:
+        log_err(f"/ask error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "mcp_url": BOX_MCP_URL}
+
+
+# ============================================================
+# ========================= CLI ==============================
+# ============================================================
+
+def update_token():
+    """Prompt user to enter a new Box token."""
+    global BOX_TOKEN, MCP_HEADERS
+    new_token = input("\n🔑 Enter new Box developer token: ").strip()
+    if new_token:
+        BOX_TOKEN = new_token
+        MCP_HEADERS["Authorization"] = f"Bearer {BOX_TOKEN}"
+        print("✅ Token updated.\n")
+    else:
+        print("⚠️  No token entered, keeping existing.\n")
+
+
+def cli():
+    print("=" * 60)
+    print("  📦 Box Chatbot — Ask anything about your Box files")
+    print("=" * 60)
+    print("Commands:")
+    print("  Type any question   → search & answer from your Box")
+    print("  :token              → update your Box access token")
+    print("  :quit / exit        → quit")
+    print("=" * 60)
+    print(f"Connected to Box MCP at: {BOX_MCP_URL}")
+    print(f"Token: {BOX_TOKEN[:10]}...{BOX_TOKEN[-4:]}")
+    print()
+
+    while True:
+        try:
+            user_input = input("You: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\n👋 Goodbye!")
+            break
+
+        if not user_input:
+            continue
+
+        if user_input.lower() in (":quit", "exit", "quit", "bye"):
+            print("👋 Goodbye!")
+            break
+
+        if user_input.lower() == ":token":
+            update_token()
+            continue
+
+        print("\n🔍 Searching your Box account...")
+        try:
+            result = answer_question(user_input)
+        except Exception as e:
+            print(f"\n❌ Error: {e}\n")
+            continue
+
+        print(f"\n📂 Files searched ({result['num_files']}):")
+        for name in result["files_searched"]:
+            print(f"   • {name}")
+
+        print(f"\n💬 Answer:\n{result['answer']}")
+        print("\n" + "-" * 60 + "\n")
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--api":
+        import uvicorn
+        print("Starting Box Chatbot API on port 8006...")
+        uvicorn.run(app, host="0.0.0.0", port=8006)
+    else:
+        cli()
